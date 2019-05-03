@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -18,14 +19,18 @@ import (
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go"
 	"github.com/xtaci/smux"
+
+	"path/filepath"
 )
 
-var (
-	// VERSION is injected by buildflags
-	VERSION = "SELFBUILD"
-	// SALT is use for pbkdf2 key expansion
-	SALT = "kcp-go"
-)
+// SALT is use for pbkdf2 key expansion
+const SALT = "kcp-go"
+
+// VERSION is injected by buildflags
+var VERSION = "SELFBUILD"
+
+// A pool for stream copying
+var xmitBuf sync.Pool
 
 type compStream struct {
 	conn net.Conn
@@ -55,9 +60,12 @@ func newCompStream(conn net.Conn) *compStream {
 	return c
 }
 
-func handleClient(sess *smux.Session, p1 io.ReadWriteCloser) {
-	log.Println("stream opened")
-	defer log.Println("stream closed")
+func handleClient(sess *smux.Session, p1 io.ReadWriteCloser, quiet bool) {
+	if !quiet {
+		log.Println("stream opened")
+		defer log.Println("stream closed")
+	}
+
 	defer p1.Close()
 	p2, err := sess.OpenStream()
 	if err != nil {
@@ -65,17 +73,29 @@ func handleClient(sess *smux.Session, p1 io.ReadWriteCloser) {
 	}
 	defer p2.Close()
 
-	// start tunnel
-	p1die := make(chan struct{})
-	go func() { io.Copy(p1, p2); close(p1die) }()
+	// start tunnel & wait for tunnel termination
+	streamCopy := func(dst io.Writer, src io.Reader) chan struct{} {
+		die := make(chan struct{})
+		go func() {
+			if wt, ok := src.(io.WriterTo); ok {
+				wt.WriteTo(dst)
+				close(die)
+			} else if rt, ok := dst.(io.ReaderFrom); ok {
+				rt.ReadFrom(src)
+				close(die)
+			} else {
+				buf := xmitBuf.Get().([]byte)
+				io.CopyBuffer(dst, src, buf)
+				xmitBuf.Put(buf)
+				close(die)
+			}
+		}()
+		return die
+	}
 
-	p2die := make(chan struct{})
-	go func() { io.Copy(p2, p1); close(p2die) }()
-
-	// wait for tunnel termination
 	select {
-	case <-p1die:
-	case <-p2die:
+	case <-streamCopy(p1, p2):
+	case <-streamCopy(p2, p1):
 	}
 }
 
@@ -92,6 +112,10 @@ func main() {
 		// add more log flags for debugging
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
+	xmitBuf.New = func() interface{} {
+		return make([]byte, 65535)
+	}
+
 	myApp := cli.NewApp()
 	myApp.Name = "kcptun"
 	myApp.Usage = "client(with SMUX)"
@@ -116,7 +140,7 @@ func main() {
 		cli.StringFlag{
 			Name:  "crypt",
 			Value: "aes",
-			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, none",
+			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none",
 		},
 		cli.StringFlag{
 			Name:  "mode",
@@ -198,14 +222,19 @@ func main() {
 			Hidden: true,
 		},
 		cli.IntFlag{
-			Name:   "sockbuf",
-			Value:  4194304, // socket buffer size in bytes
-			Hidden: true,
+			Name:  "sockbuf",
+			Value: 4194304, // socket buffer size in bytes
+			Usage: "per-socket buffer in bytes",
 		},
 		cli.IntFlag{
-			Name:   "keepalive",
-			Value:  10, // nat keepalive interval in seconds
-			Hidden: true,
+			Name:  "smuxbuf",
+			Value: 4194304,
+			Usage: "the overall de-mux buffer in bytes",
+		},
+		cli.IntFlag{
+			Name:  "keepalive",
+			Value: 10, // nat keepalive interval in seconds
+			Usage: "seconds between heartbeats",
 		},
 		cli.StringFlag{
 			Name:  "snmplog",
@@ -221,6 +250,10 @@ func main() {
 			Name:  "log",
 			Value: "",
 			Usage: "specify a log file to output, default goes to stderr",
+		},
+		cli.BoolFlag{
+			Name:  "quiet",
+			Usage: "to suppress the 'stream open/close' messages",
 		},
 		cli.StringFlag{
 			Name:  "c",
@@ -251,10 +284,12 @@ func main() {
 		config.Resend = c.Int("resend")
 		config.NoCongestion = c.Int("nc")
 		config.SockBuf = c.Int("sockbuf")
+		config.SmuxBuf = c.Int("smuxbuf")
 		config.KeepAlive = c.Int("keepalive")
 		config.Log = c.String("log")
 		config.SnmpLog = c.String("snmplog")
 		config.SnmpPeriod = c.Int("snmpperiod")
+		config.Quiet = c.Bool("quiet")
 
 		if c.String("c") != "" {
 			err := parseJSONConfig(&config, c.String("c"))
@@ -286,9 +321,12 @@ func main() {
 		listener, err := net.ListenTCP("tcp", addr)
 		checkError(err)
 
+		log.Println("initiating key derivation")
 		pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 4096, 32, sha1.New)
 		var block kcp.BlockCrypt
 		switch config.Crypt {
+		case "sm4":
+			block, _ = kcp.NewSM4BlockCrypt(pass[:16])
 		case "tea":
 			block, _ = kcp.NewTEABlockCrypt(pass[:16])
 		case "xor":
@@ -327,15 +365,17 @@ func main() {
 		log.Println("acknodelay:", config.AckNodelay)
 		log.Println("dscp:", config.DSCP)
 		log.Println("sockbuf:", config.SockBuf)
+		log.Println("smuxbuf:", config.SmuxBuf)
 		log.Println("keepalive:", config.KeepAlive)
 		log.Println("conn:", config.Conn)
 		log.Println("autoexpire:", config.AutoExpire)
 		log.Println("scavengettl:", config.ScavengeTTL)
 		log.Println("snmplog:", config.SnmpLog)
 		log.Println("snmpperiod:", config.SnmpPeriod)
+		log.Println("quiet:", config.Quiet)
 
 		smuxConfig := smux.DefaultConfig()
-		smuxConfig.MaxReceiveBuffer = config.SockBuf
+		smuxConfig.MaxReceiveBuffer = config.SmuxBuf
 		smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
 
 		createConn := func() (*smux.Session, error) {
@@ -344,7 +384,7 @@ func main() {
 				return nil, errors.Wrap(err, "createConn()")
 			}
 			kcpconn.SetStreamMode(true)
-			kcpconn.SetWriteDelay(true)
+			kcpconn.SetWriteDelay(false)
 			kcpconn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
 			kcpconn.SetWindowSize(config.SndWnd, config.RcvWnd)
 			kcpconn.SetMtu(config.MTU)
@@ -416,7 +456,7 @@ func main() {
 				muxes[idx].ttl = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
 			}
 
-			go handleClient(muxes[idx].session, p1)
+			go handleClient(muxes[idx].session, p1, config.Quiet)
 			rr++
 		}
 	}
@@ -465,7 +505,10 @@ func snmpLogger(path string, interval int) {
 	for {
 		select {
 		case <-ticker.C:
-			f, err := os.OpenFile(time.Now().Format(path), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+			// split path into dirname and filename
+			logdir, logfile := filepath.Split(path)
+			// only format logfile
+			f, err := os.OpenFile(logdir+time.Now().Format(logfile), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 			if err != nil {
 				log.Println(err)
 				return
