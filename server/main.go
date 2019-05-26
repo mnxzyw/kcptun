@@ -2,8 +2,6 @@ package main
 
 import (
 	"crypto/sha1"
-	"encoding/csv"
-	"fmt"
 	"io"
 	"log"
 	"math/rand"
@@ -16,11 +14,9 @@ import (
 
 	"golang.org/x/crypto/pbkdf2"
 
-	"path/filepath"
-
-	"github.com/golang/snappy"
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go"
+	"github.com/xtaci/kcptun/generic"
 	"github.com/xtaci/smux"
 )
 
@@ -32,34 +28,6 @@ var VERSION = "SELFBUILD"
 
 // A pool for stream copying
 var xmitBuf sync.Pool
-
-type compStream struct {
-	conn net.Conn
-	w    *snappy.Writer
-	r    *snappy.Reader
-}
-
-func (c *compStream) Read(p []byte) (n int, err error) {
-	return c.r.Read(p)
-}
-
-func (c *compStream) Write(p []byte) (n int, err error) {
-	n, err = c.w.Write(p)
-	err = c.w.Flush()
-	return n, err
-}
-
-func (c *compStream) Close() error {
-	return c.conn.Close()
-}
-
-func newCompStream(conn net.Conn) *compStream {
-	c := new(compStream)
-	c.conn = conn
-	c.w = snappy.NewBufferedWriter(conn)
-	c.r = snappy.NewReader(conn)
-	return c
-}
 
 // handle multiplex-ed connection
 func handleMux(conn io.ReadWriteCloser, config *Config) {
@@ -84,8 +52,8 @@ func handleMux(conn io.ReadWriteCloser, config *Config) {
 		go func(p1 *smux.Stream) {
 			p2, err := net.Dial("tcp", config.Target)
 			if err != nil {
-				p1.Close()
 				log.Println(err)
+				p1.Close()
 				return
 			}
 			handleClient(p1, p2, config.Quiet)
@@ -93,30 +61,27 @@ func handleMux(conn io.ReadWriteCloser, config *Config) {
 	}
 }
 
-func handleClient(p1, p2 io.ReadWriteCloser, quiet bool) {
-	if !quiet {
-		log.Println("stream opened")
-		defer log.Println("stream closed")
+func handleClient(p1 *smux.Stream, p2 io.ReadWriteCloser, quiet bool) {
+	logln := func(v ...interface{}) {
+		if !quiet {
+			log.Println(v...)
+		}
 	}
+
 	defer p1.Close()
 	defer p2.Close()
 
+	logln("stream opened", p1.ID())
+	defer logln("stream closed", p1.ID())
+
 	// start tunnel & wait for tunnel termination
-	streamCopy := func(dst io.Writer, src io.Reader) chan struct{} {
+	streamCopy := func(dst io.Writer, src io.ReadCloser) chan struct{} {
 		die := make(chan struct{})
 		go func() {
-			if wt, ok := src.(io.WriterTo); ok {
-				wt.WriteTo(dst)
-				close(die)
-			} else if rt, ok := dst.(io.ReaderFrom); ok {
-				rt.ReadFrom(src)
-				close(die)
-			} else {
-				buf := xmitBuf.Get().([]byte)
-				io.CopyBuffer(dst, src, buf)
-				xmitBuf.Put(buf)
-				close(die)
-			}
+			buf := xmitBuf.Get().([]byte)
+			generic.CopyBuffer(dst, src, buf)
+			xmitBuf.Put(buf)
+			close(die)
 		}()
 		return die
 	}
@@ -141,7 +106,7 @@ func main() {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
 	xmitBuf.New = func() interface{} {
-		return make([]byte, 65535)
+		return make([]byte, 32768)
 	}
 
 	myApp := cli.NewApp()
@@ -395,7 +360,7 @@ func main() {
 			log.Println("SetWriteBuffer:", err)
 		}
 
-		go snmpLogger(config.SnmpLog, config.SnmpPeriod)
+		go generic.SnmpLogger(config.SnmpLog, config.SnmpPeriod)
 		if config.Pprof {
 			go http.ListenAndServe(":6060", nil)
 		}
@@ -413,7 +378,7 @@ func main() {
 				if config.NoComp {
 					go handleMux(conn, &config)
 				} else {
-					go handleMux(newCompStream(conn), &config)
+					go handleMux(generic.NewCompStream(conn), &config)
 				}
 			} else {
 				log.Printf("%+v", err)
@@ -421,38 +386,4 @@ func main() {
 		}
 	}
 	myApp.Run(os.Args)
-}
-
-func snmpLogger(path string, interval int) {
-	if path == "" || interval == 0 {
-		return
-	}
-	ticker := time.NewTicker(time.Duration(interval) * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			// split path into dirname and filename
-			logdir, logfile := filepath.Split(path)
-			// only format logfile
-			f, err := os.OpenFile(logdir+time.Now().Format(logfile), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			w := csv.NewWriter(f)
-			// write header in empty file
-			if stat, err := f.Stat(); err == nil && stat.Size() == 0 {
-				if err := w.Write(append([]string{"Unix"}, kcp.DefaultSnmp.Header()...)); err != nil {
-					log.Println(err)
-				}
-			}
-			if err := w.Write(append([]string{fmt.Sprint(time.Now().Unix())}, kcp.DefaultSnmp.ToSlice()...)); err != nil {
-				log.Println(err)
-			}
-			kcp.DefaultSnmp.Reset()
-			w.Flush()
-			f.Close()
-		}
-	}
 }

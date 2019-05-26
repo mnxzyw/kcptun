@@ -298,29 +298,30 @@ Compression is enabled by default, you can disable it by setting ```-nocomp``` o
 #### SNMP
 
 ```go
-// Snmp defines network statistics indicator
 type Snmp struct {
-    BytesSent        uint64 // raw bytes sent
-    BytesReceived    uint64
-    MaxConn          uint64
-    ActiveOpens      uint64
-    PassiveOpens     uint64
-    CurrEstab        uint64 // count of connections for now
-    InErrs           uint64 // udp read errors
+    BytesSent        uint64 // bytes sent from upper level
+    BytesReceived    uint64 // bytes received to upper level
+    MaxConn          uint64 // max number of connections ever reached
+    ActiveOpens      uint64 // accumulated active open connections
+    PassiveOpens     uint64 // accumulated passive open connections
+    CurrEstab        uint64 // current number of established connections
+    InErrs           uint64 // UDP read errors reported from net.PacketConn
     InCsumErrors     uint64 // checksum errors from CRC32
-    KCPInErrors      uint64 // packet iput errors from kcp
-    InSegs           uint64
-    OutSegs          uint64
-    InBytes          uint64 // udp bytes received
-    OutBytes         uint64 // udp bytes sent
-    RetransSegs      uint64
-    FastRetransSegs  uint64
-    EarlyRetransSegs uint64
+    KCPInErrors      uint64 // packet iput errors reported from KCP
+    InPkts           uint64 // incoming packets count
+    OutPkts          uint64 // outgoing packets count
+    InSegs           uint64 // incoming KCP segments
+    OutSegs          uint64 // outgoing KCP segments
+    InBytes          uint64 // UDP bytes received
+    OutBytes         uint64 // UDP bytes sent
+    RetransSegs      uint64 // accmulated retransmited segments
+    FastRetransSegs  uint64 // accmulated fast retransmitted segments
+    EarlyRetransSegs uint64 // accmulated early retransmitted segments
     LostSegs         uint64 // number of segs infered as lost
     RepeatSegs       uint64 // number of segs duplicated
     FECRecovered     uint64 // correct packets recovered from FEC
     FECErrs          uint64 // incorrect packets recovered from FEC
-    FECSegs          uint64 // FEC segments received
+    FECParityShards  uint64 // FEC segments received
     FECShortShards   uint64 // number of data shards that's not enough for recovery
 }
 ```
@@ -375,3 +376,22 @@ via WeChat
 <img src="wechat_donate.jpg" alt="kcptun" height="120px" /> 
 
 （注意：我没有任何社交网站的账号，请小心骗子。）
+
+## Contributors
+
+This project exists thanks to all the people who contribute. 
+<a href="https://github.com/xtaci/kcptun/graphs/contributors"><img src="https://opencollective.com/kcptun/contributors.svg?width=890&button=false" /></a>
+
+
+## Backers
+
+Thank you to all our backers! 🙏 [[Become a backer](https://opencollective.com/kcptun#backer)]
+
+<a href="https://opencollective.com/kcptun#backers" target="_blank"><img src="https://opencollective.com/kcptun/backers.svg?width=890"></a>
+
+
+## Sponsors
+
+Support this project by becoming a sponsor. Your logo will show up here with a link to your website. [[Become a sponsor](https://opencollective.com/kcptun#sponsor)]
+
+
