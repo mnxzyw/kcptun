@@ -1,11 +1,16 @@
 #!/bin/bash
+
 BUILD_DIR=$(dirname "$0")/build
 mkdir -p $BUILD_DIR
 cd $BUILD_DIR
 
 sum="sha1sum"
 
-echo "If you need reproducible build, export GO111MODULE=on first"
+if [ "$GO111MODULE" != "on" ]; then
+	echo "GO111MODULE is off"
+else
+	echo "GO111MODULE is on"
+fi 
 
 if ! hash sha1sum 2>/dev/null; then
 	if ! hash shasum 2>/dev/null; then
